@@ -19,6 +19,8 @@ The `Agent` class is the easiest way to get started. It manages the full
 lifecycle — binary discovery, tool wiring, hook registration, and policy
 defaults — behind a single async context manager.
 
+The `system_instructions` parameter is optional.
+
 ```python
 import asyncio
 from google.antigravity import Agent

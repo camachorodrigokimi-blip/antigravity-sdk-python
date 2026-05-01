@@ -44,6 +44,28 @@ class AgentTest(unittest.IsolatedAsyncioTestCase):
 
     async with agent.Agent(system_instructions="test") as ag:
       self.assertEqual(ag._conversation, mock_conversation)
+
+  @mock.patch(
+      "google.antigravity.agent."
+      "local_connection.LocalConnectionStrategy"
+  )
+  @mock.patch.object(conversation.Conversation, "create")
+  async def test_agent_lifecycle_no_system_instructions(
+      self, mock_conv_create, mock_strategy_class
+  ):
+    mock_strategy_instance = mock.MagicMock()
+    mock_strategy_class.return_value = mock_strategy_instance
+
+    mock_conversation = mock.MagicMock(spec=conversation.Conversation)
+    mock_cm = mock.AsyncMock()
+    mock_cm.__aenter__.return_value = mock_conversation
+    mock_conv_create.return_value = mock_cm
+
+    async with agent.Agent() as ag:
+      self.assertEqual(ag._conversation, mock_conversation)
+      _, kwargs = mock_strategy_class.call_args
+      self.assertIsNone(kwargs.get("system_instructions"))
+
   @mock.patch(
       "google.antigravity.agent."
       "local_connection.LocalConnectionStrategy"

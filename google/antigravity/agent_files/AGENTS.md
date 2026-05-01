@@ -16,7 +16,9 @@ The SDK follows a three-layer architecture:
 
 ### 1. Using the `Agent` Class
 
-The `Agent` class handles setup and runs in **read-only mode** by default. It will automatically use the `GEMINI_API_KEY` environment variable if available.
+The `Agent` class handles setup and runs in **read-only mode** by default. It
+will automatically use the `GEMINI_API_KEY` environment variable if available.
+The `system_instructions` parameter is optional.
 
 > [!NOTE]
 > The `read_only` flag only restricts **builtin** tools. If you provide **custom** tools that perform write operations, they will not be automatically blocked by `read_only=True`. Ensure your custom tools are safe or use policies to guard them.

@@ -37,7 +37,7 @@ class Agent:
 
   def __init__(
       self,
-      system_instructions: str | types.SystemInstructions,
+      system_instructions: str | types.SystemInstructions | None = None,
       tools: list[Callable[..., Any]] | None = None,
       model: str = types.DEFAULT_MODEL,
       api_key: str | None = None,
@@ -53,7 +53,8 @@ class Agent:
     Args:
         system_instructions: System instructions for the agent. If a string is
           passed, it will be appended to the default system instructions. Use
-          `types.CustomSystemInstructions` to completely replace them.
+          `types.CustomSystemInstructions` to completely replace them. If None,
+          no additional system instructions will be added.
         tools: Custom Python tools to register.
         model: Gemini model name.
         api_key: API key for Gemini API.
