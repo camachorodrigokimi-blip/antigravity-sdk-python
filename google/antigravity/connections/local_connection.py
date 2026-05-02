@@ -157,7 +157,18 @@ class LocalConnectionStep(types.Step):
     is_from_model = source == types.StepSource.MODEL
     is_done = status == types.StepStatus.DONE
     has_text = bool(step_dict.get("text"))
-    is_final_response = is_from_model and is_done and has_text
+    is_target_user = step_dict.get("target") == "TARGET_USER"
+    # The idle signal (trajectory_state_update / STATE_IDLE) arrives as a
+    # separate event type with no text content, so we cannot retroactively
+    # mark a step as "final" at idle time. Instead, we flag each step that
+    # is a completed model response directed at the user. Multiple steps
+    # per turn may carry this flag; consumers that want the *last*
+    # response should iterate fully (Conversation.chat() does this).
+    # TODO(karmel): Rename is_final_response to better reflect that
+    # multiple steps per turn may match this heuristic.
+    is_final_response = (
+        is_from_model and is_done and has_text and is_target_user
+    )
 
     structured_output = None
     if step_type == types.StepType.FINISH:
@@ -338,10 +349,6 @@ class LocalConnection(connection.Connection):
         return
       if isinstance(step_obj, Exception):
         raise step_obj
-
-      # Filter out environment steps here
-      if getattr(step_obj, "target", None) == "TARGET_ENVIRONMENT":
-        continue
 
       yield step_obj
 

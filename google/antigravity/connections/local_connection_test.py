@@ -567,16 +567,17 @@ class LocalConnectionStepFromDictTest(unittest.TestCase):
   """
 
   def test_is_final_response_true(self):
-    """Verifies is_final_response is True when source=MODEL, state=DONE, and text is present.
+    """Verifies is_final_response is True when source=MODEL, state=DONE, target=TARGET_USER, and text is present.
 
     Why: This is the canonical "agent finished speaking" signal that callers
-    rely on to surface the final answer. The derivation at lines 134-137 must
-    produce True when all three conditions hold.
+    rely on to surface the final answer. All four conditions must hold:
+    source is MODEL, status is DONE, text is present, and target is USER.
     """
     step = local_connection.LocalConnectionStep.from_dict({
         "source": "SOURCE_MODEL",
         "state": "STATE_DONE",
         "text": "Here is my answer.",
+        "target": "TARGET_USER",
     })
     self.assertTrue(step.is_final_response)
 
@@ -625,6 +626,22 @@ class LocalConnectionStepFromDictTest(unittest.TestCase):
         "state": "STATE_ERROR",
         "text": "Something went wrong",
         "error_message": "internal error",
+    })
+    self.assertFalse(step.is_final_response)
+
+  def test_is_final_response_false_when_target_environment(self):
+    """Verifies is_final_response is False for TARGET_ENVIRONMENT steps.
+
+    Why: Tool execution steps (view_file, run_command, etc.) are targeted at
+    the environment, not the user. Even when they are source=MODEL, state=DONE,
+    and have text (e.g. "Requesting permission to make tool call"), they must
+    not be treated as the agent's final answer.
+    """
+    step = local_connection.LocalConnectionStep.from_dict({
+        "source": "SOURCE_MODEL",
+        "state": "STATE_DONE",
+        "text": "Requesting permission to make tool call",
+        "target": "TARGET_ENVIRONMENT",
     })
     self.assertFalse(step.is_final_response)
 
@@ -1388,6 +1405,167 @@ class LocalConnectionPostTurnHookTest(unittest.IsolatedAsyncioTestCase):
       steps.append(step)
 
     self.assertEqual(len(steps), 1)
+    self.assertEqual(captured, ["Final answer"])
+
+  async def test_receive_steps_includes_target_environment(self):
+    """Verifies TARGET_ENVIRONMENT steps are yielded by receive_steps().
+
+    What: After removing the TARGET_ENVIRONMENT filter, environment-targeted
+    steps (tool executions like view_file, run_command) must flow through
+    receive_steps() alongside user-targeted steps.
+
+    Why: SDK consumers need a complete trajectory history. Previously,
+    environment steps were silently dropped, making it impossible to
+    observe internal tool activity.
+
+    How: Send two step updates — one TARGET_ENVIRONMENT (a tool permission
+    request) and one TARGET_USER (the final answer). Assert both are yielded,
+    and only the TARGET_USER step has is_final_response=True.
+    """
+    conn = local_connection.LocalConnection(
+        process=self.mock_process,
+        ws=self.mock_ws,
+        tool_runner=self.tool_runner,
+    )
+
+    # Simulate a send to create turn context.
+    await conn.send("hello")
+
+    # Step 1: A TARGET_ENVIRONMENT step (tool execution).
+    env_event = localharness_pb2.OutputEvent(
+        step_update=localharness_pb2.StepUpdate(
+            cascade_id="test_traj",
+            trajectory_id="test_traj",
+            step_index=1,
+            text="Requesting permission to make tool call",
+            state=localharness_pb2.StepUpdate.STATE_DONE,
+            source=localharness_pb2.StepUpdate.SOURCE_MODEL,
+            target=localharness_pb2.StepUpdate.TARGET_ENVIRONMENT,
+        )
+    )
+
+    # Step 2: A TARGET_USER step (the final answer).
+    user_event = localharness_pb2.OutputEvent(
+        step_update=localharness_pb2.StepUpdate(
+            cascade_id="test_traj",
+            trajectory_id="test_traj",
+            step_index=2,
+            text="Here is my answer.",
+            state=localharness_pb2.StepUpdate.STATE_DONE,
+            source=localharness_pb2.StepUpdate.SOURCE_MODEL,
+            target=localharness_pb2.StepUpdate.TARGET_USER,
+        )
+    )
+
+    idle_event = localharness_pb2.OutputEvent(
+        trajectory_state_update=localharness_pb2.TrajectoryStateUpdate(
+            trajectory_id="test_traj",
+            state=localharness_pb2.TrajectoryStateUpdate.STATE_IDLE,
+        )
+    )
+
+    await self.mock_ws.put_event(env_event)
+    await self.mock_ws.put_event(user_event)
+    await self.mock_ws.put_event(idle_event)
+
+    steps = []
+    async for step in conn.receive_steps():
+      steps.append(step)
+
+    # Both steps must be yielded (the old filter would have dropped step 1).
+    self.assertEqual(len(steps), 2)
+
+    # Step 1: environment step — yielded but NOT a final response.
+    self.assertEqual(
+        steps[0].content, "Requesting permission to make tool call"
+    )
+    self.assertEqual(steps[0].target, "TARGET_ENVIRONMENT")
+    self.assertFalse(steps[0].is_final_response)
+
+    # Step 2: user step — the real final response.
+    self.assertEqual(steps[1].content, "Here is my answer.")
+    self.assertEqual(steps[1].target, "TARGET_USER")
+    self.assertTrue(steps[1].is_final_response)
+
+  async def test_post_turn_hook_not_fired_for_environment_step(self):
+    """Verifies PostTurnHook does NOT fire for TARGET_ENVIRONMENT steps.
+
+    What: A terminal model step with target=TARGET_ENVIRONMENT must not
+    trigger the post-turn hook. Only TARGET_USER terminal steps should.
+
+    Why: Now that environment steps flow through receive_steps(), the
+    post-turn dispatch guard (which checks is_target_user) must correctly
+    skip them. Otherwise the hook would fire prematurely on tool execution
+    steps and clear the turn context before the real final response arrives.
+
+    How: Send a TARGET_ENVIRONMENT terminal model step followed by a
+    TARGET_USER terminal model step. Assert the post-turn hook fires
+    exactly once, with the content from the TARGET_USER step.
+    """
+    captured = []
+
+    class PostTurnHook:
+
+      async def run(self, context, data):  # pylint: disable=unused-argument
+        captured.append(data)
+
+    hr = hook_runner.HookRunner()
+    hr.post_turn_hooks.append(PostTurnHook())
+
+    conn = local_connection.LocalConnection(
+        process=self.mock_process,
+        ws=self.mock_ws,
+        tool_runner=self.tool_runner,
+        hook_runner=hr,
+    )
+
+    await conn.send("hello")
+
+    # A terminal environment step that should NOT trigger the hook.
+    env_event = localharness_pb2.OutputEvent(
+        step_update=localharness_pb2.StepUpdate(
+            cascade_id="test_traj",
+            trajectory_id="test_traj",
+            step_index=1,
+            text="Requesting permission to make tool call",
+            state=localharness_pb2.StepUpdate.STATE_DONE,
+            source=localharness_pb2.StepUpdate.SOURCE_MODEL,
+            target=localharness_pb2.StepUpdate.TARGET_ENVIRONMENT,
+        )
+    )
+
+    # The real final response that SHOULD trigger the hook.
+    user_event = localharness_pb2.OutputEvent(
+        step_update=localharness_pb2.StepUpdate(
+            cascade_id="test_traj",
+            trajectory_id="test_traj",
+            step_index=2,
+            text="Final answer",
+            state=localharness_pb2.StepUpdate.STATE_DONE,
+            source=localharness_pb2.StepUpdate.SOURCE_MODEL,
+            target=localharness_pb2.StepUpdate.TARGET_USER,
+        )
+    )
+
+    idle_event = localharness_pb2.OutputEvent(
+        trajectory_state_update=localharness_pb2.TrajectoryStateUpdate(
+            trajectory_id="test_traj",
+            state=localharness_pb2.TrajectoryStateUpdate.STATE_IDLE,
+        )
+    )
+
+    await self.mock_ws.put_event(env_event)
+    await self.mock_ws.put_event(user_event)
+    await self.mock_ws.put_event(idle_event)
+
+    steps = []
+    async for step in conn.receive_steps():
+      steps.append(step)
+
+    # Both steps yielded.
+    self.assertEqual(len(steps), 2)
+
+    # Hook fired exactly once, with the TARGET_USER step's content.
     self.assertEqual(captured, ["Final answer"])
 
 
