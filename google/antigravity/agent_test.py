@@ -525,7 +525,7 @@ class AgentTest(unittest.IsolatedAsyncioTestCase):
       "local_connection.LocalConnectionStrategy"
   )
   @mock.patch.object(conversation.Conversation, "create")
-  async def test_agent_with_workspaces(
+  async def test_agent_with_session_config(
       self, mock_conv_create, mock_strategy_class
   ):
     del mock_conv_create  # Unused.
@@ -534,14 +534,19 @@ class AgentTest(unittest.IsolatedAsyncioTestCase):
     mock_strategy_instance.stop = mock.AsyncMock()
     mock_strategy_class.return_value = mock_strategy_instance
 
-    workspaces = ["/path/1", "/path/2"]
-    config = agent.AgentConfig(
-        system_instructions="test", workspaces=workspaces
+    sc = types.SessionConfig(
+        conversation_id="resume-id",
+        save_dir="/state",
+        workspaces=["/path/1", "/path/2"],
     )
+    config = agent.AgentConfig(system_instructions="test", session_config=sc)
     async with agent.Agent(config) as _:
       _, kwargs = mock_strategy_class.call_args
-      ws = kwargs.get("workspaces")
-      self.assertEqual(ws, workspaces)
+      session_config = kwargs.get("session_config")
+      self.assertEqual(session_config, sc)
+      self.assertEqual(session_config.conversation_id, "resume-id")
+      self.assertEqual(session_config.save_dir, "/state")
+      self.assertEqual(session_config.workspaces, ["/path/1", "/path/2"])
 
   @mock.patch(
       "google.antigravity.agent."
@@ -830,6 +835,19 @@ class AgentConfigTest(unittest.TestCase):
           capabilities_config.finish_tool_schema_json,
           '{"properties": {"field": {"type": "string"}}}',
       )
+
+  def test_conversation_id_returns_none_before_session(self):
+    """Verifies conversation_id is None before the session starts."""
+    a = agent.Agent(agent.AgentConfig(system_instructions="test"))
+    self.assertIsNone(a.conversation_id)
+
+  def test_conversation_id_returns_value_after_session(self):
+    """Verifies conversation_id returns the runtime-assigned ID."""
+    a = agent.Agent(agent.AgentConfig(system_instructions="test"))
+    mock_conv = mock.MagicMock()
+    mock_conv.conversation_id = "test-conv-123"
+    a._conversation = mock_conv
+    self.assertEqual(a.conversation_id, "test-conv-123")
 
 
 if __name__ == "__main__":

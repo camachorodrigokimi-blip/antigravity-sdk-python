@@ -15,6 +15,7 @@
 """Local connection for the Antigravity SDK."""
 
 import asyncio
+import collections
 import dataclasses
 import importlib.resources
 import json
@@ -23,6 +24,7 @@ import os
 import shutil
 import struct
 import subprocess
+import threading
 from typing import Any, AsyncIterator, Callable
 
 from google.genai import types as genai_types
@@ -275,6 +277,16 @@ class LocalConnection(connection.Connection):
     # field) can distinguish parent vs. subagent trajectories.
     self._cascade_id: str | None = None
 
+    # Flag set early in disconnect() so the reader loop can distinguish
+    # expected closures from harness crashes.
+    self._disconnecting = False
+
+    # Stderr lines from the Go harness, captured by a background thread.
+    # Retained in a bounded deque so the reader loop can surface harness
+    # error messages when the WebSocket closes unexpectedly.
+    self._stderr_lines: collections.deque[str] = collections.deque(maxlen=100)
+    self._stderr_thread: threading.Thread | None = None
+
 
     # Dispatch session start hook.
     if self._hook_runner and self._hook_runner.on_session_start_hooks:
@@ -367,8 +379,57 @@ class LocalConnection(connection.Connection):
     async for _ in self.receive_steps():
       pass
 
+  def _start_stderr_reader(self, stderr_stream) -> None:
+    """Starts a background daemon thread that drains the harness stderr.
+
+    The Go harness writes diagnostic messages to stderr.  If the OS
+    pipe buffer fills (typically 64 KiB on Linux), the harness blocks
+    on its next write and cannot save trajectory state at shutdown.
+    This thread prevents that by reading continuously and storing the
+    most recent lines in a bounded deque for later diagnostics.
+
+    Args:
+      stderr_stream: The binary stderr stream from the harness process.
+    """
+
+    def _drain():
+      try:
+        for raw_line in stderr_stream:
+          line = raw_line.decode("utf-8", errors="replace").rstrip()
+          self._stderr_lines.append(line)
+          logging.debug("harness stderr: %s", line)
+      except ValueError:
+        pass  # Stream closed.
+
+    t = threading.Thread(target=_drain, daemon=True, name="harness-stderr")
+    t.start()
+    self._stderr_thread = t
+
   async def disconnect(self) -> None:
-    """Disconnects the session and releases resources."""
+    """Tears down the harness connection in a careful order.
+
+    Shutdown sequence:
+
+    1. Dispatch the ``on_session_end`` hook so user code can react.
+    2. Cancel background tasks (pending hook dispatches, etc.).
+    3. Cancel the WebSocket reader task.
+    4. Close the WebSocket (0.5 s timeout).  This triggers the Go
+       handler's ``defer`` block, which calls ``agent.Close()`` and
+       serializes the trajectory.
+    5. Close stdin.  The Go main loop detects EOF and runs
+       ``cleanupAllAgents`` → ``os.Exit(0)``.
+    6. Wait for the process to exit.  The trajectory write is
+       sub-second, so a generous 5 s is more than enough.
+    7. If the process is still alive, escalate: SIGTERM (1 s wait)
+       then SIGKILL (1 s wait).
+
+    ``stdout`` is already closed after the ``OutputConfig`` handshake
+    since it is only used for the initial ``OutputConfig`` handshake.
+
+    After closing stdin the process should exit on its own.  We wait up
+    to 5 s, then escalate to SIGTERM, then SIGKILL.
+    """
+    self._disconnecting = True
     hook_error = None
 
     # Dispatch session end hook before tearing down. If the hook raises,
@@ -393,20 +454,30 @@ class LocalConnection(connection.Connection):
       except asyncio.CancelledError:
         pass
 
-      # The Go server (localharness) does not send a response Close frame to
-      # perform a graceful WebSocket handshake; it just drops the TCP
-      # connection. We use a timeout here to avoid hanging indefinitely
-      # waiting for a response.
+      # Close the WebSocket first.  This triggers the Go handler's
+      # defer block which calls agent.Close() and serializes the
+      # trajectory.  The Go server does not send a response Close
+      # frame, so we use a short timeout.
       try:
         await asyncio.wait_for(self._ws.close(), timeout=0.5)
       except asyncio.TimeoutError:
         pass
 
-      self._process.terminate()
+      # Close stdin to signal the Go main loop to exit.  On EOF the
+      # harness runs cleanupAllAgents and calls os.Exit(0).
+      if self._process.stdin:
+        self._process.stdin.close()
+
+      # Wait for the process to exit, escalating if needed.
       try:
         self._process.wait(timeout=5)
       except subprocess.TimeoutExpired:
-        self._process.kill()
+        self._process.terminate()
+        try:
+          self._process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+          self._process.kill()
+          self._process.wait(timeout=1)
     finally:
       if hook_error is not None:
         raise hook_error
@@ -564,27 +635,19 @@ class LocalConnection(connection.Connection):
         elif event.HasField("tool_call"):
           self._run_in_background(self._handle_tool_call(event.tool_call))
     except websockets.ConnectionClosed as e:
-      # The WebSocket can close for several expected reasons:
-      #
-      #  1. The Python side called disconnect(), which sends a close frame
-      #     and terminates the process.  By that point the reader task has
-      #     already been cancelled, so we usually don't even reach here.
-      #
-      #  2. The Go localharness Run loop exited (e.g. context cancelled,
-      #     executor error, or input channel closed) and closed its outCh,
-      #     causing the HTTP handler to return and defer conn.Close() to
-      #     fire.  gorilla/websocket drops the TCP connection without a
-      #     graceful close handshake, so this always shows up as code 1006.
-      #
-      # In both cases the connection closure is expected and the _is_idle
-      # event / terminal-step detection in receive_steps() already provide
-      # proper "when to stop" semantics.  We log and let the finally-block
-      # sentinel terminate the iterator cleanly.
-      logging.info(
-          "WebSocket closed (code %s, reason=%s); treating as normal shutdown.",
-          e.code,
-          e.reason or "none",
-      )
+      if self._disconnecting:
+        # Expected closure — disconnect() was called.
+        logging.info("WebSocket closed (code %s); normal shutdown.", e.code)
+      else:
+        # Unexpected closure — the harness process likely crashed.
+        # Surface the harness stderr so callers get actionable context.
+        stderr_tail = "\n".join(self._stderr_lines) or "(no stderr output)"
+        error_msg = (
+            f"Harness process exited unexpectedly (WS close code {e.code})."
+            f"\nHarness stderr:\n{stderr_tail}"
+        )
+        logging.error(error_msg)
+        await self._step_queue.put(types.AntigravityConnectionError(error_msg))
 
     except Exception as e:  # pylint: disable=broad-except
       logging.exception("Error in reader loop: %s", e)
@@ -881,11 +944,10 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
       tool_runner: t_runner.ToolRunner | None = None,
       hook_runner: h_runner.HookRunner | None = None,
       gemini_config: str | types.GeminiConfig | None = None,
-      workspaces: list[str] | None = None,
       skills_paths: list[str] | None = None,
       system_instructions: str | types.SystemInstructions | None = None,
       capabilities_config: types.CapabilitiesConfig | None = None,
-      cascade_id: str | None = None,
+      session_config: types.SessionConfig | None = None,
   ):
     self._binary_path = binary_path or _get_default_binary_path()
     self._tool_runner = tool_runner
@@ -898,7 +960,6 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
       )
     else:
       self._gemini_config = gemini_config
-    self._workspaces = workspaces
     self._skills_paths = skills_paths
 
     # Normalize str shorthand to SystemInstructions model.
@@ -911,7 +972,7 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
     self._capabilities_config = (
         capabilities_config or types.CapabilitiesConfig()
     )
-    self._cascade_id = cascade_id
+    self._session_config = session_config or types.SessionConfig()
 
   def _build_harness_config(self) -> localharness_pb2.HarnessConfig:
     """Translates Pydantic config objects into a HarnessConfig proto."""
@@ -962,16 +1023,14 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
       if thinking_level is not None:
         gemini_config_proto.thinking_level = thinking_level.value
 
-    workspace_protos = []
-    if self._workspaces:
-      workspace_protos = [
-          localharness_pb2.Workspace(
-              filesystem_workspace=localharness_pb2.FilesystemWorkspace(
-                  directory=p
-              )
-          )
-          for p in self._workspaces
-      ]
+    workspace_protos = [
+        localharness_pb2.Workspace(
+            filesystem_workspace=localharness_pb2.FilesystemWorkspace(
+                directory=p
+            )
+        )
+        for p in (self._session_config.workspaces or [])
+    ]
 
     cfg = self._capabilities_config
 
@@ -1021,7 +1080,7 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
     harness_config = localharness_pb2.HarnessConfig(
         tools=tool_protos,
         system_instructions=system_instructions_proto,
-        cascade_id=self._cascade_id or "",
+        cascade_id=self._session_config.conversation_id or "",
         gemini_config=gemini_config_proto,
         workspaces=workspace_protos,
         skills_paths=self._skills_paths or [],
@@ -1057,7 +1116,9 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
       )
 
     harness_config = self._build_harness_config()
-    input_config = localharness_pb2.InputConfig()
+    input_config = localharness_pb2.InputConfig(
+        storage_directory=self._session_config.save_dir or "",
+    )
 
     process = subprocess.Popen(
         [self._binary_path],
@@ -1124,6 +1185,7 @@ class LocalConnectionStrategy(connection.ConnectionStrategy):
         tool_runner=self._tool_runner,
         hook_runner=self._hook_runner,
     )
+    self._connection._start_stderr_reader(process.stderr)
 
   async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
     """Tears down the backend and releases all resources."""

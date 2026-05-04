@@ -17,6 +17,7 @@
 import asyncio
 import json
 import logging
+import tempfile
 from typing import Any, Callable
 
 import pydantic
@@ -58,6 +59,7 @@ class AgentConfig(pydantic.BaseModel):
     triggers: Custom triggers to register.
     mcp_servers: MCP server configurations.
     workspaces: Directory paths to restrict the agent to.
+    session_config: Session persistence and resumption configuration.
     response_schema: Optional Pydantic model or JSON schema dict for structured
       output.
     skills_paths: List of paths to skills to load.
@@ -82,6 +84,9 @@ class AgentConfig(pydantic.BaseModel):
   triggers: list[triggers_lib.Trigger] = pydantic.Field(default_factory=list)
   mcp_servers: list[dict[str, Any]] = pydantic.Field(default_factory=list)
   workspaces: list[str] = pydantic.Field(default_factory=list)
+  session_config: types.SessionConfig = pydantic.Field(
+      default_factory=types.SessionConfig
+  )
   response_schema: dict[str, Any] | type[pydantic.BaseModel] | str | None = None
   skills_paths: list[str] = pydantic.Field(default_factory=list)
 
@@ -246,13 +251,23 @@ class Agent:
       else:
         si = self._config.system_instructions
 
+      session = self._config.session_config
+      # Merge top-level workspaces into session_config.
+      if self._config.workspaces:
+        merged = list(session.workspaces or []) + self._config.workspaces
+        session = session.model_copy(update={"workspaces": merged})
+      if session.save_dir is None:
+        default_dir = tempfile.mkdtemp(prefix="antigravity_")
+        logging.info("No save_dir specified; using %s", default_dir)
+        session = session.model_copy(update={"save_dir": default_dir})
+
       self._strategy = local_connection.LocalConnectionStrategy(
           tool_runner=self._tool_runner,
           hook_runner=self._hook_runner,
           gemini_config=self._config.gemini_config,
           system_instructions=si,
           capabilities_config=self._config.capabilities,
-          workspaces=self._config.workspaces,
+          session_config=session,
           skills_paths=self._config.skills_paths,
       )
 
@@ -344,3 +359,15 @@ class Agent:
           "Agent session not started. Use 'async with Agent(...)'."
       )
     return self._conversation._connection
+
+  @property
+  def conversation_id(self) -> str | None:
+    """Returns the conversation identifier assigned by the runtime.
+
+    Available after the session has started and at least one message has
+    been exchanged.  Pass this value back via SessionConfig.conversation_id
+    to resume from a saved session.  Returns None before the session starts.
+    """
+    if not self._conversation:
+      return None
+    return self._conversation.conversation_id or None

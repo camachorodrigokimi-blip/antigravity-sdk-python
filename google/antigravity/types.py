@@ -256,6 +256,26 @@ class CapabilitiesConfig(pydantic.BaseModel):
     return self
 
 
+class SessionConfig(pydantic.BaseModel):
+  """Configuration for the agent session's identity, persistence, and workspace.
+
+  Groups session-scoped settings that control how the runtime manages
+  conversation state and where the agent is allowed to operate.
+
+  Attributes:
+    conversation_id: Opaque string identifying this conversation. When provided
+      together with save_dir, enables resumption of a previous session. When
+      None, a fresh identifier is generated automatically.
+    save_dir: Filesystem path where session state is persisted (e.g. trajectory
+      history). Required for resumption. If None, the session is ephemeral.
+    workspaces: Directory paths the agent is allowed to operate in.
+  """
+
+  conversation_id: str | None = None
+  save_dir: str | None = None
+  workspaces: list[str] = pydantic.Field(default_factory=list)
+
+
 # =============================================================================
 # Tool types
 # =============================================================================
@@ -452,8 +472,6 @@ class AntigravityConnectionError(Exception):
   Raised when a connection to an agent backend cannot be established or
   encounters a fatal protocol-level error.
   """
-
-  pass
 
 
 class AntigravityValidationError(Exception):

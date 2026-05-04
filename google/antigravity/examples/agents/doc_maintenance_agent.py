@@ -131,7 +131,7 @@ async def main():
       policies=policies,
       hooks=[PrintToolCallHook()],
       capabilities=types.CapabilitiesConfig(),
-      workspaces=[target_dir],
+      session_config=types.SessionConfig(workspaces=[target_dir]),
   )
   async with Agent(config) as agent:
 

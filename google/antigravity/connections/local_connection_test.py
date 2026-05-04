@@ -15,12 +15,15 @@
 """Unit tests for LocalConnection."""
 
 import asyncio
+import io
 import json
+import subprocess
 import unittest
 from unittest import mock
 
 from absl.testing import absltest
 from google.protobuf import json_format
+import websockets
 
 from google.antigravity import types
 from google.antigravity.connections import local_connection
@@ -939,10 +942,13 @@ class LocalConnectionStrategyConfigTest(unittest.TestCase):
 
     Why: The harness uses a structured Workspace proto with FilesystemWorkspace;
     plain strings must be wrapped correctly.
-    How: Pass two paths, build proto, and assert each workspace directory.
+    How: Pass two paths via session_config, build proto, and assert each
+    workspace directory.
     """
     strategy = self._make_strategy(
-        workspaces=["/home/user/project", "/tmp/scratch"]
+        session_config=types.SessionConfig(
+            workspaces=["/home/user/project", "/tmp/scratch"]
+        ),
     )
     config = strategy._build_harness_config()
     self.assertEqual(len(config.workspaces), 2)
@@ -959,7 +965,7 @@ class LocalConnectionStrategyConfigTest(unittest.TestCase):
     """Verifies that no workspaces are set when not provided.
 
     Why: The harness should not receive spurious workspace entries.
-    How: Build with default workspaces=None and assert empty repeated field.
+    How: Build with default session_config and assert empty repeated field.
     """
     strategy = self._make_strategy()
     config = strategy._build_harness_config()
@@ -968,11 +974,13 @@ class LocalConnectionStrategyConfigTest(unittest.TestCase):
   def test_empty_workspaces_list(self):
     """Verifies that an empty list produces an empty repeated field.
 
-    Why: workspaces=[] is a valid explicit choice meaning "no workspaces",
+    Why: workspaces=[] is a valid explicit choice meaning 'no workspaces',
     distinct from None (which also means no workspaces but is implicit).
-    How: Pass empty list and assert empty repeated field.
+    How: Pass empty list via session_config and assert empty repeated field.
     """
-    strategy = self._make_strategy(workspaces=[])
+    strategy = self._make_strategy(
+        session_config=types.SessionConfig(workspaces=[])
+    )
     config = strategy._build_harness_config()
     self.assertEqual(len(config.workspaces), 0)
 
@@ -1066,15 +1074,63 @@ class LocalConnectionStrategyConfigTest(unittest.TestCase):
     self.assertEqual(config.compaction_threshold, 0)
 
   def test_cascade_id_passed_through(self):
-    """Verifies that cascade_id appears in HarnessConfig.cascade_id.
+    """Verifies that session_config.conversation_id maps to HarnessConfig.cascade_id.
 
     Why: cascade_id is used for session resumption; if it's lost, the
     harness creates a new session instead of resuming.
-    How: Set cascade_id and assert it appears on the proto.
+    How: Set conversation_id via session_config and assert it appears
+    on the proto.
     """
-    strategy = self._make_strategy(cascade_id="resume-123")
+    strategy = self._make_strategy(
+        session_config=types.SessionConfig(conversation_id="resume-123")
+    )
     config = strategy._build_harness_config()
     self.assertEqual(config.cascade_id, "resume-123")
+
+  def test_cascade_id_default_empty(self):
+    """Verifies that cascade_id defaults to empty string when no conversation_id set.
+
+    Why: The harness treats an empty cascade_id as a fresh session.
+    How: Build with default session_config and assert empty cascade_id.
+    """
+    strategy = self._make_strategy()
+    config = strategy._build_harness_config()
+    self.assertEqual(config.cascade_id, "")
+
+  def test_storage_directory_from_save_dir(self):
+    """Verifies save_dir maps to InputConfig.storage_directory.
+
+    Why: The harness writes trajectory data to storage_directory. If
+    save_dir is silently dropped, session state is never persisted and
+    resumption breaks.
+    How: Set save_dir via session_config and assert it appears on
+    the strategy's stored config for InputConfig construction.
+    """
+    strategy = self._make_strategy(
+        session_config=types.SessionConfig(save_dir="/tmp/state"),
+    )
+    self.assertEqual(strategy._session_config.save_dir, "/tmp/state")
+
+  def test_storage_directory_defaults_to_none(self):
+    """Verifies save_dir is None when not specified.
+
+    Why: A None save_dir signals an ephemeral session. The or "" fallback
+    in __aenter__ must produce an empty string for the proto.
+    How: Build with default session_config and assert save_dir is None.
+    """
+    strategy = self._make_strategy()
+    self.assertIsNone(strategy._session_config.save_dir)
+
+  def test_workspaces_default_empty(self):
+    """Verifies no workspace protos when session_config has no workspaces.
+
+    Why: The or [] fallback prevents iterating over None. If removed,
+    the list comprehension raises TypeError on None.
+    How: Build with default session_config and assert empty workspaces.
+    """
+    strategy = self._make_strategy()
+    config = strategy._build_harness_config()
+    self.assertEqual(len(config.workspaces), 0)
 
   def test_gemini_config_thinking_level_set(self):
     """Verifies that thinking_level on ModelEntry maps to the proto field."""
@@ -1150,6 +1206,52 @@ class LocalConnectionStrategyConfigTest(unittest.TestCase):
     )
     config = strategy._build_harness_config()
     self.assertEqual(config.gemini_config.api_key, "shared-key")
+
+  def test_session_config_save_dir_stored(self):
+    """Verifies that session_config.save_dir is preserved on the strategy.
+
+    Why: save_dir maps to InputConfig.storage_directory during __aenter__.
+    The strategy must store it so the startup sequence can use it.
+    How: Set save_dir via session_config and assert strategy attribute.
+    """
+    strategy = self._make_strategy(
+        session_config=types.SessionConfig(save_dir="/data/sessions")
+    )
+    self.assertEqual(strategy._session_config.save_dir, "/data/sessions")
+
+  def test_session_config_save_dir_default_none(self):
+    """Verifies that save_dir defaults to None when not provided.
+
+    Why: When no save_dir is set, InputConfig.storage_directory should be
+    empty and persistence is disabled.
+    How: Build with default session_config and assert save_dir is None.
+    """
+    strategy = self._make_strategy()
+    self.assertIsNone(strategy._session_config.save_dir)
+
+  def test_full_session_config_to_proto(self):
+    """Verifies that a full session_config produces correct proto fields.
+
+    Why: This is the canonical resumption case — all three session fields
+    must map correctly to their proto counterparts.
+    How: Set all session_config fields, build proto, and assert each mapping.
+    """
+    strategy = self._make_strategy(
+        session_config=types.SessionConfig(
+            conversation_id="session-789",
+            save_dir="/state/dir",
+            workspaces=["/ws/a"],
+        )
+    )
+    config = strategy._build_harness_config()
+    self.assertEqual(config.cascade_id, "session-789")
+    self.assertEqual(len(config.workspaces), 1)
+    self.assertEqual(
+        config.workspaces[0].filesystem_workspace.directory, "/ws/a"
+    )
+    # save_dir is wired in __aenter__, not _build_harness_config;
+    # verify storage.
+    self.assertEqual(strategy._session_config.save_dir, "/state/dir")
 
 
 class LocalConnectionStrategyApiKeyTest(unittest.IsolatedAsyncioTestCase):
@@ -2042,6 +2144,310 @@ class LocalConnectionHookAcceptanceTest(unittest.IsolatedAsyncioTestCase):
         ws=self.mock_ws,
         hook_runner=hr,
     )
+
+
+class LocalConnectionStderrReaderTest(unittest.IsolatedAsyncioTestCase):
+  """Tests for the background stderr reader thread."""
+
+  def setUp(self):
+    super().setUp()
+    self.mock_process = mock.MagicMock()
+    self.mock_ws = FakeWebSocket()
+
+  async def test_start_stderr_reader_drains_lines(self):
+    """Verifies that _start_stderr_reader captures stderr lines.
+
+    Why: The Go harness writes diagnostic messages to stderr.  If the
+    pipe buffer fills, the harness blocks and cannot save trajectory state
+    at shutdown.  The reader thread prevents this by draining continuously.
+    How: Write lines to a pipe, start the reader, and assert the deque
+    contains all written lines.
+    """
+
+    conn = local_connection.LocalConnection(
+        process=self.mock_process,
+        ws=self.mock_ws,
+    )
+
+    stream = io.BytesIO(b"line1\nline2\nline3\n")
+    conn._start_stderr_reader(stream)
+    conn._stderr_thread.join(timeout=2)
+
+    self.assertEqual(list(conn._stderr_lines), ["line1", "line2", "line3"])
+
+  async def test_stderr_reader_respects_maxlen(self):
+    """Verifies the deque drops old lines when it exceeds maxlen.
+
+    Why: Unbounded buffering could consume excessive memory during
+    long-running sessions.  The deque is bounded at 100 lines.
+    How: Write 105 lines and confirm only the last 100 remain.
+    """
+
+    conn = local_connection.LocalConnection(
+        process=self.mock_process,
+        ws=self.mock_ws,
+    )
+
+    lines = "".join(f"line{i}\n" for i in range(105))
+    stream = io.BytesIO(lines.encode())
+    conn._start_stderr_reader(stream)
+    conn._stderr_thread.join(timeout=2)
+
+    self.assertEqual(len(conn._stderr_lines), 100)
+    self.assertEqual(conn._stderr_lines[0], "line5")
+    self.assertEqual(conn._stderr_lines[-1], "line104")
+
+  async def test_stderr_reader_handles_closed_stream(self):
+    """Verifies the reader thread exits cleanly when the stream closes.
+
+    Why: On process exit the stderr pipe closes.  The thread must not
+    crash or log errors; it should simply stop.
+    How: Pass an already-closed stream and verify the thread exits without
+    raising.
+    """
+    conn = local_connection.LocalConnection(
+        process=self.mock_process,
+        ws=self.mock_ws,
+    )
+
+    stream = io.BytesIO(b"")
+    conn._start_stderr_reader(stream)
+    conn._stderr_thread.join(timeout=2)
+    self.assertFalse(conn._stderr_thread.is_alive())
+
+  async def test_stderr_reader_thread_is_daemon(self):
+    """Verifies the stderr reader thread is a daemon thread.
+
+    Why: The stderr reader must not prevent process exit.  If it were a
+    non-daemon thread, a hung harness could keep the Python process alive
+    indefinitely.
+    How: Start the reader and check the thread's daemon attribute.
+    """
+    conn = local_connection.LocalConnection(
+        process=self.mock_process,
+        ws=self.mock_ws,
+    )
+
+    stream = io.BytesIO(b"line1\n")
+    conn._start_stderr_reader(stream)
+    self.assertTrue(conn._stderr_thread.daemon)
+    conn._stderr_thread.join(timeout=2)
+
+
+class LocalConnectionDisconnectTest(unittest.IsolatedAsyncioTestCase):
+  """Tests for the disconnect shutdown sequence."""
+
+  def setUp(self):
+    super().setUp()
+    self.mock_process = mock.MagicMock()
+    self.mock_process.stdin = mock.MagicMock()
+    self.mock_process.wait.return_value = 0
+    self.mock_ws = FakeWebSocket()
+
+  async def test_disconnect_sets_disconnecting_flag(self):
+    """Verifies _disconnecting is set before any cleanup runs.
+
+    Why: The reader loop uses this flag to distinguish expected closures
+    from harness crashes.  It must be set early in disconnect().
+    How: Call disconnect and check the flag is True.
+    """
+    conn = local_connection.LocalConnection(
+        process=self.mock_process,
+        ws=self.mock_ws,
+    )
+    await conn.disconnect()
+    self.assertTrue(conn._disconnecting)
+
+  async def test_disconnect_closes_stdin(self):
+    """Verifies stdin is closed during disconnect to trigger harness save.
+
+    Why: The Go harness monitors stdin for EOF.  On EOF it runs
+    cleanupAllAgents which persists trajectory state to disk.  Without
+    closing stdin, the trajectory is never saved.
+    How: Call disconnect and verify stdin.close() was called.
+    """
+    conn = local_connection.LocalConnection(
+        process=self.mock_process,
+        ws=self.mock_ws,
+    )
+    await conn.disconnect()
+    self.mock_process.stdin.close.assert_called_once()
+
+  async def test_disconnect_waits_for_process(self):
+    """Verifies disconnect waits for the harness process to exit.
+
+    Why: The harness needs time to flush trajectory state after stdin
+    closes.  Killing it immediately would lose the trajectory.
+    How: Call disconnect and verify process.wait(timeout=5) was called.
+    """
+    conn = local_connection.LocalConnection(
+        process=self.mock_process,
+        ws=self.mock_ws,
+    )
+    await conn.disconnect()
+    self.mock_process.wait.assert_called_with(timeout=5)
+
+  async def test_disconnect_terminates_on_timeout(self):
+    """Verifies SIGTERM is sent when the process doesn't exit in time.
+
+    Why: If the harness hangs during cleanup, the SDK must not block
+    indefinitely.  SIGTERM is the first escalation.
+    How: Make wait() raise TimeoutExpired on the first call, then verify
+    terminate() is called.
+    """
+    self.mock_process.wait.side_effect = [
+        subprocess.TimeoutExpired("cmd", 5),  # First wait times out.
+        0,  # After terminate, process exits.
+    ]
+    conn = local_connection.LocalConnection(
+        process=self.mock_process,
+        ws=self.mock_ws,
+    )
+    await conn.disconnect()
+    self.mock_process.terminate.assert_called_once()
+
+  async def test_disconnect_kills_on_double_timeout(self):
+    """Verifies SIGKILL is sent when SIGTERM also fails.
+
+    Why: If the process ignores SIGTERM, SIGKILL is the last resort.
+    How: Make wait() raise TimeoutExpired twice, then verify kill() is called.
+    """
+    self.mock_process.wait.side_effect = [
+        subprocess.TimeoutExpired("cmd", 5),  # First wait.
+        subprocess.TimeoutExpired("cmd", 1),  # After terminate.
+        0,  # After kill.
+    ]
+    conn = local_connection.LocalConnection(
+        process=self.mock_process,
+        ws=self.mock_ws,
+    )
+    await conn.disconnect()
+    self.mock_process.terminate.assert_called_once()
+    self.mock_process.kill.assert_called_once()
+
+  async def test_disconnect_closes_ws_before_stdin(self):
+    """Verifies the WebSocket is closed before stdin.
+
+    Why: The Go HTTP handler's defer saves the trajectory when the handler
+    returns.  agent.Close() blocks on <-runChan, which requires the Run
+    goroutine to exit.  Run exits when the WS input loop breaks.  So the
+    WS must close first to unblock agent.Close().  Stdin close triggers
+    os.Exit(0), so it must come after the defer has had time to save.
+    How: Record the call order of ws.close and stdin.close.
+    """
+    call_order = []
+    original_close = self.mock_ws.close
+
+    async def track_ws_close():
+      call_order.append("ws_close")
+      await original_close()
+
+    self.mock_ws.close = track_ws_close
+    self.mock_process.stdin.close.side_effect = lambda: call_order.append(
+        "stdin_close"
+    )
+
+    conn = local_connection.LocalConnection(
+        process=self.mock_process,
+        ws=self.mock_ws,
+    )
+    await conn.disconnect()
+    self.assertEqual(call_order, ["ws_close", "stdin_close"])
+
+
+class LocalConnectionUnexpectedCloseTest(unittest.IsolatedAsyncioTestCase):
+  """Tests for error surfacing when the harness crashes mid-session."""
+
+  def setUp(self):
+    super().setUp()
+    self.mock_process = mock.MagicMock()
+
+  async def test_unexpected_ws_close_surfaces_stderr(self):
+    """Verifies harness stderr is surfaced when the WS closes unexpectedly.
+
+    Why: When the harness crashes (e.g., model error, OOM), the WebSocket
+    closes with code 1006.  The user needs the harness stderr to diagnose
+    the failure.  Previously, this was silently logged and swallowed.
+    How: Simulate a ConnectionClosed exception in the reader loop and
+    verify an AntigravityConnectionError with stderr content is queued.
+    """
+
+    # Create a FakeWebSocket that raises ConnectionClosed immediately.
+    class CrashingWebSocket:
+
+      def __init__(self):
+        self.sent_messages = []
+
+      async def send(self, message):
+        self.sent_messages.append(message)
+
+      def __aiter__(self):
+        async def _gen():
+          raise websockets.ConnectionClosed(rcvd=None, sent=None)
+          yield  # Make it a generator.  pylint: disable=unreachable
+
+        return _gen()
+
+      async def close(self):
+        pass
+
+    ws = CrashingWebSocket()
+    conn = local_connection.LocalConnection(
+        process=self.mock_process,
+        ws=ws,
+    )
+    # Seed some stderr context.
+    conn._stderr_lines.append("Failed to call model: quota exceeded")
+
+    # Wait for reader loop to process the crash.
+    await asyncio.sleep(0.1)
+
+    # The step queue should contain the error, then the sentinel None.
+    item = await asyncio.wait_for(conn._step_queue.get(), timeout=2)
+    self.assertIsInstance(item, types.AntigravityConnectionError)
+    self.assertIn("quota exceeded", str(item))
+    self.assertIn("WS close code", str(item))
+
+  async def test_expected_ws_close_does_not_surface_error(self):
+    """Verifies no error is queued when disconnect() initiated the close.
+
+    Why: When the user calls disconnect(), the WebSocket close is expected
+    and should not be reported as an error.
+    How: Set _disconnecting=True, trigger a ConnectionClosed, and verify
+    only the sentinel (None) is in the queue.
+    """
+
+    class DisconnectingWebSocket:
+
+      def __init__(self):
+        self.sent_messages = []
+
+      async def send(self, message):
+        self.sent_messages.append(message)
+
+      def __aiter__(self):
+        async def _gen():
+          raise websockets.ConnectionClosed(rcvd=None, sent=None)
+          yield  # pylint: disable=unreachable
+
+        return _gen()
+
+      async def close(self):
+        pass
+
+    ws = DisconnectingWebSocket()
+    conn = local_connection.LocalConnection(
+        process=self.mock_process,
+        ws=ws,
+    )
+    conn._disconnecting = True
+
+    # Wait for reader loop.
+    await asyncio.sleep(0.1)
+
+    # Should only see the sentinel, not an error.
+    item = await asyncio.wait_for(conn._step_queue.get(), timeout=2)
+    self.assertIsNone(item)
 
 
 
