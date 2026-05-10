@@ -131,6 +131,7 @@ class Conversation:
     Yields:
       Thought, Text, or ToolCall events in real-time.
     """
+    seen_tool_ids: set[str] = set()
     async for step in self.receive_steps():
       is_model = step.source == types.StepSource.MODEL
       is_target_user = step.target == types.StepTarget.USER
@@ -146,10 +147,16 @@ class Conversation:
         if step.content_delta:
           yield types.Text(step_index=step.step_index, text=step.content_delta)
 
-      # Yield tool calls in real-time as they are dispatched
+      # Yield tool calls in real-time, deduplicating across steps.
+      # The agentic loop can emit the same ToolCall in multiple step
+      # transitions (dispatch, execution, result).  Calls without an
+      # ID are always yielded since we cannot determine duplicates.
       if step.tool_calls:
         for call in step.tool_calls:
-          yield call
+          if call.id is None or call.id not in seen_tool_ids:
+            if call.id is not None:
+              seen_tool_ids.add(call.id)
+            yield call
 
   def get_last_structured_output(self) -> Any | None:
     """Extracts the structured output payload from the most recent FINISH step.

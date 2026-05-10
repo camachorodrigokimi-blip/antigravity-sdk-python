@@ -330,6 +330,91 @@ class ConversationReceiveChunksTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(chunks[0].name, "view_file")
     self.assertEqual(chunks[0].args, {"path": "README.md"})
 
+  async def test_receive_chunks_deduplicates_tool_calls(self) -> None:
+    """Verifies that the same ToolCall emitted across multiple steps is yielded only once."""
+    tc = types.ToolCall(
+        id="call_456", name="generate_image", args={"prompt": "cat"}
+    )
+    # The agentic loop can emit the same tool call in dispatch,
+    # execution, and result steps.
+    s_dispatch = _make_step(
+        "", step_index=1, step_type=types.StepType.TOOL_CALL
+    )
+    s_dispatch.tool_calls = [tc]
+
+    s_exec = _make_step(
+        "", step_index=2, step_type=types.StepType.TOOL_CALL
+    )
+    s_exec.tool_calls = [tc]
+
+    s_result = _make_step(
+        "", step_index=3, step_type=types.StepType.TOOL_CALL
+    )
+    s_result.tool_calls = [tc]
+
+    mock_connection = mock.MagicMock(spec=connection.Connection)
+
+    async def mock_generator():
+      yield s_dispatch
+      yield s_exec
+      yield s_result
+
+    mock_connection.receive_steps.return_value = mock_generator()
+    conv = conversation.Conversation(mock_connection)
+
+    chunks = [chunk async for chunk in conv.receive_chunks()]
+
+    tool_calls = [c for c in chunks if isinstance(c, types.ToolCall)]
+    self.assertEqual(len(tool_calls), 1)
+    self.assertEqual(tool_calls[0].id, "call_456")
+
+  async def test_receive_chunks_yields_distinct_tool_calls(self) -> None:
+    """Verifies that different tool calls with different IDs are all yielded."""
+    tc1 = types.ToolCall(id="call_a", name="tool_1", args={})
+    tc2 = types.ToolCall(id="call_b", name="tool_2", args={})
+
+    step = _make_step("", step_index=1, step_type=types.StepType.TOOL_CALL)
+    step.tool_calls = [tc1, tc2]
+
+    mock_connection = mock.MagicMock(spec=connection.Connection)
+
+    async def mock_generator():
+      yield step
+
+    mock_connection.receive_steps.return_value = mock_generator()
+    conv = conversation.Conversation(mock_connection)
+
+    chunks = [chunk async for chunk in conv.receive_chunks()]
+
+    tool_calls = [c for c in chunks if isinstance(c, types.ToolCall)]
+    self.assertEqual(len(tool_calls), 2)
+    self.assertEqual(tool_calls[0].id, "call_a")
+    self.assertEqual(tool_calls[1].id, "call_b")
+
+  async def test_receive_chunks_never_deduplicates_none_id_calls(self) -> None:
+    """Verifies that tool calls with id=None are always yielded."""
+    tc1 = types.ToolCall(id=None, name="tool_x", args={"a": 1})
+    tc2 = types.ToolCall(id=None, name="tool_x", args={"a": 2})
+
+    s1 = _make_step("", step_index=1, step_type=types.StepType.TOOL_CALL)
+    s1.tool_calls = [tc1]
+    s2 = _make_step("", step_index=2, step_type=types.StepType.TOOL_CALL)
+    s2.tool_calls = [tc2]
+
+    mock_connection = mock.MagicMock(spec=connection.Connection)
+
+    async def mock_generator():
+      yield s1
+      yield s2
+
+    mock_connection.receive_steps.return_value = mock_generator()
+    conv = conversation.Conversation(mock_connection)
+
+    chunks = [chunk async for chunk in conv.receive_chunks()]
+
+    tool_calls = [c for c in chunks if isinstance(c, types.ToolCall)]
+    self.assertEqual(len(tool_calls), 2)
+
 
 class ConversationHistoryTest(unittest.IsolatedAsyncioTestCase):
   """Validates history accessors across multiple turns."""
